@@ -1,7 +1,7 @@
 {
 	"name": "emdash-plugin-leads",
-	"version": "0.2.0",
-	"description": "Lead capture and management plugin for EmDash CMS - forms, pipelines, email notifications, and CRM-ready exports",
+	"version": "0.3.0",
+	"description": "Forms and CRM plugin for EmDash CMS — form builder, submissions, spam protection, lead pipeline, and contact management",
 	"type": "module",
 	"main": "src/index.ts",
 	"exports": {
@@ -15,10 +15,12 @@
 		"emdash",
 		"cms",
 		"plugin",
+		"forms",
 		"leads",
 		"crm",
-		"lead-capture",
-		"sales",
+		"contact-form",
+		"form-builder",
+		"submissions",
 		"pipeline"
 	],
 	"author": "",

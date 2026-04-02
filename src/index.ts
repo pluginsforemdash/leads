@@ -1,36 +1,28 @@
 /**
- * Leads Plugin for EmDash CMS
+ * Forms Plugin for EmDash CMS
  *
- * Capture, manage, and convert leads from your website.
+ * Build forms, collect submissions, and optionally manage leads with a
+ * full CRM pipeline.
  *
- * Features:
- * - Public lead capture endpoint (embeddable forms)
- * - Spam protection (honeypot + optional Cloudflare Turnstile)
- * - Lead pipeline with statuses (new, contacted, qualified, converted, lost)
- * - Built-in email notifications (free with own Resend key, or $10/mo managed)
- * - Lead assignment to team members
- * - Notes and activity log per lead
- * - CSV export
- * - Dashboard widget with pipeline stats
- * - Webhook forwarding to external CRMs
+ * ## Tiers
  *
- * Standard format — works in both trusted and sandboxed modes.
+ * **Free ($0)** — Unlimited forms and submissions. Spam protection,
+ * webhooks, CSV export, email via own Resend key.
  *
- * ## Email Tiers
+ * **Pro ($10/mo)** — Managed email, auto-responders to submitters,
+ * submission analytics, multi-page forms.
  *
- * - **Free**: Bring your own Resend API key. Paste it in plugin settings.
- * - **Pro ($10/mo)**: Use our managed email relay. Enter your license key
- *   from https://pluginsforemdash.com/pricing to activate.
+ * **Pro CRM ($29/mo)** — Full lead pipeline, scoring, team assignment,
+ * activity log, contact records.
  *
  * @example
  * ```typescript
- * // astro.config.mjs
- * import { leadsPlugin } from "emdash-plugin-leads";
+ * import { formsPlugin } from "emdash-plugin-leads";
  *
  * export default defineConfig({
  *   integrations: [
  *     emdash({
- *       plugins: [leadsPlugin()],
+ *       plugins: [formsPlugin()],
  *     }),
  *   ],
  * });
@@ -39,34 +31,56 @@
 
 import type { PluginDescriptor } from "emdash";
 
-export interface LeadsPluginOptions {
-	/** Maximum leads to store before auto-archiving oldest (default: 10000) */
-	maxLeads?: number;
-	/** Auto-archive leads older than N days (default: 90) */
-	autoArchiveDays?: number;
+export interface FormsPluginOptions {
+	/** Max submissions to keep (default: 50000) */
+	maxSubmissions?: number;
 }
 
-export function leadsPlugin(options: LeadsPluginOptions = {}): PluginDescriptor<LeadsPluginOptions> {
+export function formsPlugin(
+	options: FormsPluginOptions = {},
+): PluginDescriptor<FormsPluginOptions> {
 	return {
-		id: "leads",
-		version: "0.2.0",
+		id: "forms",
+		version: "0.3.0",
 		format: "standard",
 		entrypoint: "emdash-plugin-leads/sandbox",
 		options,
 		capabilities: ["network:fetch", "read:users"],
-		allowedHosts: ["api.resend.com", "api.pluginsforemdash.com", "challenges.cloudflare.com"],
+		allowedHosts: [
+			"api.resend.com",
+			"api.pluginsforemdash.com",
+			"challenges.cloudflare.com",
+		],
 		storage: {
-			leads: {
-				indexes: ["status", "source", "assignee", "createdAt", "email"],
+			forms: {
+				indexes: ["slug", "status", "createdAt"],
+				uniqueIndexes: ["slug"],
+			},
+			submissions: {
+				indexes: ["formId", "status", "createdAt", "email"],
+				// composite for querying submissions by form + date
+			},
+			contacts: {
+				indexes: ["email", "status", "assignee", "createdAt", "score"],
+				uniqueIndexes: ["email"],
 			},
 			activities: {
-				indexes: ["leadId", "createdAt"],
+				indexes: ["contactId", "createdAt"],
 			},
 		},
 		adminPages: [
-			{ path: "/", label: "Leads", icon: "list" },
+			{ path: "/", label: "Dashboard", icon: "chart" },
+			{ path: "/forms", label: "Forms", icon: "list" },
+			{ path: "/submissions", label: "Submissions", icon: "inbox" },
+			{ path: "/contacts", label: "CRM", icon: "users" },
+			{ path: "/analytics", label: "Analytics", icon: "chart" },
 			{ path: "/settings", label: "Settings", icon: "gear" },
 		],
-		adminWidgets: [{ id: "pipeline-overview", title: "Lead Pipeline", size: "half" }],
+		adminWidgets: [
+			{ id: "submissions-overview", title: "Recent Submissions", size: "half" },
+		],
 	};
 }
+
+// Keep legacy export for backwards compat
+export const leadsPlugin = formsPlugin;

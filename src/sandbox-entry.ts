@@ -1,107 +1,162 @@
 /**
- * Sandbox Entry Point — Leads Plugin
+ * Sandbox Entry Point — Forms Plugin v0.3.0
  *
- * Runs in both trusted (in-process) and sandboxed (isolate) modes.
- *
- * Email delivery tiers:
- * - Free: user provides their own Resend API key
- * - Pro ($10/mo): managed relay via api.emdashleads.com
+ * Three tiers:
+ * - Free: form collector, submissions, spam protection, webhooks, export
+ * - Pro ($10/mo): managed email, auto-responders, analytics
+ * - Pro CRM ($29/mo): lead pipeline, scoring, assignment, contacts
  */
 
 import { definePlugin } from "emdash";
 import type { PluginContext } from "emdash";
 import { z } from "astro/zod";
 
-// ── Types ──
+// ══════════════════════════════════════════
+// TYPES
+// ══════════════════════════════════════════
 
-interface Lead {
+interface FormField {
+	id: string;
+	type: "text" | "email" | "textarea" | "select" | "checkbox" | "radio" | "number" | "phone" | "url" | "date" | "file" | "hidden";
+	label: string;
+	required: boolean;
+	placeholder?: string;
+	options?: string[]; // for select, radio, checkbox
+	defaultValue?: string;
+}
+
+interface Form {
 	name: string;
+	slug: string;
+	description?: string;
+	fields: FormField[];
+	status: "active" | "draft" | "archived";
+	settings: {
+		notificationEmail?: string;
+		redirectUrl?: string;
+		successMessage?: string;
+		autoResponder?: { subject: string; body: string }; // Pro
+	};
+	submissionCount: number;
+	createdAt: string;
+	updatedAt: string;
+}
+
+interface Submission {
+	formId: string;
+	formName: string;
+	data: Record<string, unknown>;
+	email?: string; // extracted if form has email field
+	status: "new" | "read" | "starred" | "archived" | "spam";
+	ip?: string;
+	userAgent?: string;
+	createdAt: string;
+}
+
+interface Contact {
 	email: string;
+	name: string;
 	phone?: string;
 	company?: string;
-	message?: string;
-	source: string;
 	status: "new" | "contacted" | "qualified" | "converted" | "lost";
+	score: number; // 0-100
 	assignee?: string;
-	score?: number;
-	tags?: string[];
-	customFields?: Record<string, unknown>;
+	tags: string[];
+	source?: string;
+	submissionCount: number;
+	lastSubmissionAt?: string;
 	createdAt: string;
 	updatedAt: string;
 }
 
 interface Activity {
-	leadId: string;
-	type: "note" | "status_change" | "assignment" | "email_sent" | "created";
+	contactId: string;
+	type: "note" | "status_change" | "assignment" | "submission" | "score_change";
 	description: string;
 	userId?: string;
 	createdAt: string;
 }
 
-type EmailTier = "none" | "free" | "pro";
+// ══════════════════════════════════════════
+// SCHEMAS
+// ══════════════════════════════════════════
 
-const LEAD_STATUSES = ["new", "contacted", "qualified", "converted", "lost"] as const;
+const fieldSchema = z.object({
+	id: z.string().min(1),
+	type: z.enum(["text", "email", "textarea", "select", "checkbox", "radio", "number", "phone", "url", "date", "file", "hidden"]),
+	label: z.string().min(1).max(200),
+	required: z.boolean().default(false),
+	placeholder: z.string().max(200).optional(),
+	options: z.array(z.string()).optional(),
+	defaultValue: z.string().optional(),
+});
 
-const MANAGED_API_URL = "https://api.pluginsforemdash.com/v1/email/send";
-
-// ── Input Schemas ──
-
-const captureSchema = z.object({
+const formCreateSchema = z.object({
 	name: z.string().min(1).max(200),
-	email: z.string().email().max(320),
-	phone: z.string().max(50).optional(),
-	company: z.string().max(200).optional(),
-	message: z.string().max(5000).optional(),
-	source: z.string().max(100).default("website"),
-	customFields: z.record(z.unknown()).optional(),
-	// Honeypot — must be empty (bots fill it, humans don't see it)
+	slug: z.string().min(1).max(200).regex(/^[a-z0-9-]+$/),
+	description: z.string().max(2000).optional(),
+	fields: z.array(fieldSchema).min(1),
+	status: z.enum(["active", "draft"]).default("draft"),
+	notificationEmail: z.string().email().optional(),
+	redirectUrl: z.string().max(500).optional(),
+	successMessage: z.string().max(1000).optional(),
+	autoResponderSubject: z.string().max(200).optional(),
+	autoResponderBody: z.string().max(5000).optional(),
+});
+
+const formUpdateSchema = formCreateSchema.partial().extend({
+	id: z.string().min(1),
+});
+
+const submitSchema = z.object({
+	formSlug: z.string().min(1),
+	data: z.record(z.unknown()),
 	_hp_website: z.string().max(0).optional(),
-	// Turnstile token — optional, validated server-side if configured
 	"cf-turnstile-response": z.string().optional(),
 });
 
-const listSchema = z.object({
-	status: z.enum(LEAD_STATUSES).optional(),
-	source: z.string().optional(),
-	assignee: z.string().optional(),
-	limit: z.coerce.number().min(1).max(100).default(50),
-	cursor: z.string().optional(),
-});
-
-const getSchema = z.object({
+const contactUpdateSchema = z.object({
 	id: z.string().min(1),
-});
-
-const updateSchema = z.object({
-	id: z.string().min(1),
-	status: z.enum(LEAD_STATUSES).optional(),
+	status: z.enum(["new", "contacted", "qualified", "converted", "lost"]).optional(),
 	assignee: z.string().optional(),
 	score: z.number().min(0).max(100).optional(),
 	tags: z.array(z.string()).optional(),
 });
 
-const addNoteSchema = z.object({
-	leadId: z.string().min(1),
+const noteSchema = z.object({
+	contactId: z.string().min(1),
 	note: z.string().min(1).max(5000),
 });
 
-const deleteSchema = z.object({
-	id: z.string().min(1),
+const listSchema = z.object({
+	limit: z.coerce.number().min(1).max(100).default(50),
+	cursor: z.string().optional(),
+	status: z.string().optional(),
+	formId: z.string().optional(),
 });
 
+const idSchema = z.object({ id: z.string().min(1) });
+
 const exportSchema = z.object({
-	status: z.enum(LEAD_STATUSES).optional(),
+	formId: z.string().optional(),
+	status: z.string().optional(),
 	format: z.enum(["csv", "json"]).default("csv"),
 });
 
-// ── Helpers ──
+// ══════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════
 
-function generateId(): string {
+function genId(): string {
 	return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function now(): string {
 	return new Date().toISOString();
+}
+
+function today(): string {
+	return new Date().toISOString().slice(0, 10);
 }
 
 function escapeCsv(value: unknown): string {
@@ -112,243 +167,142 @@ function escapeCsv(value: unknown): string {
 	return str;
 }
 
-// ── Spam Protection ──
-
-async function verifyTurnstile(
-	token: string,
-	secretKey: string,
-	ctx: PluginContext,
-): Promise<boolean> {
-	if (!ctx.http) return false;
-
-	try {
-		const response = await ctx.http.fetch(
-			"https://challenges.cloudflare.com/turnstile/v0/siteverify",
-			{
-				method: "POST",
-				headers: { "Content-Type": "application/x-www-form-urlencoded" },
-				body: new URLSearchParams({
-					secret: secretKey,
-					response: token,
-				}).toString(),
-			},
-		);
-
-		const result = (await response.json()) as { success: boolean };
-		return result.success === true;
-	} catch (error) {
-		ctx.log.warn("Turnstile verification failed", error);
-		return false;
-	}
+function formatNum(n: number): string {
+	return new Intl.NumberFormat("en-US").format(n);
 }
 
-// ── Email Delivery ──
-
-async function getEmailTier(ctx: PluginContext): Promise<EmailTier> {
-	const licenseKey = await ctx.kv.get<string>("settings:licenseKey");
-	if (licenseKey) return "pro";
-
-	const resendKey = await ctx.kv.get<string>("settings:resendApiKey");
-	if (resendKey) return "free";
-
-	return "none";
+function throw404(msg: string): never {
+	throw new Response(JSON.stringify({ error: msg }), { status: 404, headers: { "Content-Type": "application/json" } });
+}
+function throw400(msg: string): never {
+	throw new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } });
+}
+function throw403(msg: string): never {
+	throw new Response(JSON.stringify({ error: msg, upgrade: true }), { status: 403, headers: { "Content-Type": "application/json" } });
 }
 
-async function sendEmail(
-	ctx: PluginContext,
-	to: string,
-	subject: string,
-	text: string,
-	from?: string,
-): Promise<boolean> {
+// ══════════════════════════════════════════
+// TIER & EMAIL
+// ══════════════════════════════════════════
+
+type Tier = "free" | "pro" | "pro_crm";
+
+async function getTier(ctx: PluginContext): Promise<Tier> {
+	const key = await ctx.kv.get<string>("settings:licenseKey");
+	if (!key) return "free";
+	const tier = await ctx.kv.get<string>("settings:licenseTier");
+	if (tier === "pro_crm") return "pro_crm";
+	return "pro";
+}
+
+async function isPro(ctx: PluginContext): Promise<boolean> {
+	return (await getTier(ctx)) !== "free";
+}
+
+function requirePro(pro: boolean, feature: string): void {
+	if (!pro) throw403(`${feature} requires Pro. Upgrade at pluginsforemdash.com/pricing`);
+}
+
+function requireCRM(tier: Tier, feature: string): void {
+	if (tier !== "pro_crm") throw403(`${feature} requires Pro CRM ($29/mo). Upgrade at pluginsforemdash.com/pricing`);
+}
+
+const PLATFORM_API = "https://api.pluginsforemdash.com/v1";
+
+async function sendEmail(ctx: PluginContext, to: string, subject: string, text: string): Promise<boolean> {
 	if (!ctx.http) return false;
 
-	const tier = await getEmailTier(ctx);
-	if (tier === "none") return false;
+	const tier = await getTier(ctx);
 
-	const senderEmail = from ?? (await ctx.kv.get<string>("settings:fromEmail")) ?? "leads@notifications.pluginsforemdash.com";
-
-	try {
-		if (tier === "pro") {
-			// Managed API — authenticated with license key
-			const licenseKey = await ctx.kv.get<string>("settings:licenseKey");
-			const response = await ctx.http.fetch(MANAGED_API_URL, {
+	if (tier !== "free") {
+		// Pro: managed email via platform
+		const licenseKey = await ctx.kv.get<string>("settings:licenseKey");
+		const from = (await ctx.kv.get<string>("settings:fromEmail")) ?? "forms@notifications.pluginsforemdash.com";
+		try {
+			const res = await ctx.http.fetch(`${PLATFORM_API}/email/send`, {
 				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					"Authorization": `Bearer ${licenseKey}`,
-				},
-				body: JSON.stringify({ from: senderEmail, to, subject, text }),
+				headers: { "Content-Type": "application/json", "Authorization": `Bearer ${licenseKey}` },
+				body: JSON.stringify({ from, to, subject, text }),
 			});
-
-			if (!response.ok) {
-				const body = await response.text();
-				ctx.log.warn(`Managed email API error: ${response.status} ${body}`);
-				return false;
-			}
-			return true;
-		}
-
-		// Free tier — direct Resend API
-		const resendKey = await ctx.kv.get<string>("settings:resendApiKey");
-		const response = await ctx.http.fetch("https://api.resend.com/emails", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"Authorization": `Bearer ${resendKey}`,
-			},
-			body: JSON.stringify({ from: senderEmail, to, subject, text }),
-		});
-
-		if (!response.ok) {
-			const body = await response.text();
-			ctx.log.warn(`Resend API error: ${response.status} ${body}`);
-			return false;
-		}
-		return true;
-	} catch (error) {
-		ctx.log.warn("Email send failed", error);
-		return false;
+			return res.ok;
+		} catch { return false; }
 	}
-}
 
-// ── Notifications ──
+	// Free: own Resend key
+	const resendKey = await ctx.kv.get<string>("settings:resendApiKey");
+	if (!resendKey) return false;
 
-async function notifyNewLead(lead: Lead, ctx: PluginContext): Promise<void> {
-	const notifyEmail = await ctx.kv.get<string>("settings:notificationEmail");
-	if (!notifyEmail) return;
-
-	await sendEmail(
-		ctx,
-		notifyEmail,
-		`New lead: ${lead.name} (${lead.source})`,
-		[
-			`New lead captured from ${lead.source}:`,
-			"",
-			`Name: ${lead.name}`,
-			`Email: ${lead.email}`,
-			lead.phone ? `Phone: ${lead.phone}` : null,
-			lead.company ? `Company: ${lead.company}` : null,
-			lead.message ? `\nMessage:\n${lead.message}` : null,
-			"",
-			`View in admin: /_emdash/admin/plugins/leads`,
-		]
-			.filter(Boolean)
-			.join("\n"),
-	);
-}
-
-async function forwardToWebhook(lead: Lead, ctx: PluginContext): Promise<void> {
-	const webhookUrl = await ctx.kv.get<string>("settings:webhookUrl");
-	if (!webhookUrl || !ctx.http) return;
-
+	const from = (await ctx.kv.get<string>("settings:fromEmail")) ?? "forms@notifications.pluginsforemdash.com";
 	try {
-		const token = await ctx.kv.get<string>("settings:webhookToken");
-		const headers: Record<string, string> = {
-			"Content-Type": "application/json",
-			"X-EmDash-Event": "lead:created",
-		};
-		if (token) headers["Authorization"] = `Bearer ${token}`;
-
-		await ctx.http.fetch(webhookUrl, {
+		const res = await ctx.http.fetch("https://api.resend.com/emails", {
 			method: "POST",
-			headers,
-			body: JSON.stringify({
-				event: "lead:created",
-				timestamp: now(),
-				lead,
-			}),
+			headers: { "Content-Type": "application/json", "Authorization": `Bearer ${resendKey}` },
+			body: JSON.stringify({ from, to, subject, text }),
 		});
-	} catch (error) {
-		ctx.log.warn("Failed to forward lead to webhook", error);
-	}
+		return res.ok;
+	} catch { return false; }
 }
 
-async function logActivity(
-	ctx: PluginContext,
-	leadId: string,
-	type: Activity["type"],
-	description: string,
-	userId?: string,
-): Promise<void> {
-	await ctx.storage.activities!.put(generateId(), {
-		leadId,
-		type,
-		description,
-		userId,
-		createdAt: now(),
-	});
-}
+// ══════════════════════════════════════════
+// SPAM PROTECTION
+// ══════════════════════════════════════════
 
-// ── Rate Limiting (in-memory, per-isolate) ──
-
-const captureTimestamps = new Map<string, number[]>();
-const RATE_LIMIT_WINDOW = 60_000; // 1 minute
-const RATE_LIMIT_MAX = 5; // 5 submissions per minute per IP/email
-
-function isRateLimited(key: string): boolean {
-	const cutoff = Date.now() - RATE_LIMIT_WINDOW;
-	const timestamps = (captureTimestamps.get(key) ?? []).filter((t) => t > cutoff);
-	captureTimestamps.set(key, timestamps);
-
-	if (timestamps.length >= RATE_LIMIT_MAX) return true;
-
-	timestamps.push(Date.now());
+const rateLimits = new Map<string, number[]>();
+function isRateLimited(key: string, max: number = 5, windowMs: number = 60_000): boolean {
+	const cutoff = Date.now() - windowMs;
+	const stamps = (rateLimits.get(key) ?? []).filter((t) => t > cutoff);
+	rateLimits.set(key, stamps);
+	if (stamps.length >= max) return true;
+	stamps.push(Date.now());
 	return false;
 }
 
-// ── Plugin Definition ──
+async function verifyTurnstile(token: string, secretKey: string, ctx: PluginContext): Promise<boolean> {
+	if (!ctx.http) return false;
+	try {
+		const res = await ctx.http.fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ secret: secretKey, response: token }).toString(),
+		});
+		const data = (await res.json()) as { success: boolean };
+		return data.success === true;
+	} catch { return false; }
+}
+
+// ══════════════════════════════════════════
+// PLUGIN DEFINITION
+// ══════════════════════════════════════════
 
 export default definePlugin({
 	hooks: {
 		"plugin:install": {
 			handler: async (_event: unknown, ctx: PluginContext) => {
-				ctx.log.info("Leads plugin installed");
-				await ctx.kv.set("settings:notificationEmail", "");
-				await ctx.kv.set("settings:webhookUrl", "");
-				await ctx.kv.set("settings:autoArchiveDays", 90);
-				await ctx.kv.set("settings:maxLeads", 10000);
-				await ctx.kv.set("settings:spamProtection", "honeypot");
+				ctx.log.info("Forms plugin installed");
+				await ctx.kv.set("settings:fromEmail", "");
+				await ctx.kv.set("settings:resendApiKey", "");
 			},
 		},
 
 		"plugin:activate": {
 			handler: async (_event: unknown, ctx: PluginContext) => {
 				if (ctx.cron) {
-					await ctx.cron.schedule("archive-old-leads", { schedule: "@daily" });
+					await ctx.cron.schedule("cleanup-spam", { schedule: "@weekly" });
 				}
 			},
 		},
 
 		cron: {
 			handler: async (event: { name: string }, ctx: PluginContext) => {
-				if (event.name === "archive-old-leads") {
-					const days =
-						(await ctx.kv.get<number>("settings:autoArchiveDays")) ?? 90;
-					const cutoff = new Date(
-						Date.now() - days * 24 * 60 * 60 * 1000,
-					).toISOString();
-
-					const old = await ctx.storage.leads!.query({
-						where: {
-							status: { in: ["new", "contacted"] },
-							createdAt: { lte: cutoff },
-						},
+				if (event.name === "cleanup-spam") {
+					const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+					const spam = await ctx.storage.submissions!.query({
+						where: { status: "spam", createdAt: { lte: cutoff } },
 						limit: 100,
 					});
-
-					for (const item of old.items) {
-						const lead = item.data as Lead;
-						await ctx.storage.leads!.put(item.id, {
-							...lead,
-							status: "lost",
-							updatedAt: now(),
-						});
-						await logActivity(ctx, item.id, "status_change", "Auto-archived (inactive)");
-					}
-
-					if (old.items.length > 0) {
-						ctx.log.info(`Archived ${old.items.length} inactive leads`);
+					if (spam.items.length > 0) {
+						await ctx.storage.submissions!.deleteMany(spam.items.map((i: { id: string }) => i.id));
+						ctx.log.info(`Cleaned ${spam.items.length} old spam submissions`);
 					}
 				}
 			},
@@ -356,375 +310,525 @@ export default definePlugin({
 	},
 
 	routes: {
-		// ── Public: Lead Capture ──
+		// ══════════════════════════════════════════
+		// PUBLIC
+		// ══════════════════════════════════════════
 
-		capture: {
+		"storefront/form": {
 			public: true,
-			input: captureSchema,
-			handler: async (routeCtx: { input: z.infer<typeof captureSchema>; request: Request }, ctx: PluginContext) => {
-				const input = routeCtx.input;
+			input: z.object({ slug: z.string().min(1) }),
+			handler: async (routeCtx: { input: { slug: string } }, ctx: PluginContext) => {
+				const result = await ctx.storage.forms!.query({ where: { slug: routeCtx.input.slug, status: "active" }, limit: 1 });
+				if (result.items.length === 0) throw404("Form not found");
+				const form = result.items[0]!.data as Form;
+				return {
+					name: form.name,
+					slug: form.slug,
+					description: form.description,
+					fields: form.fields,
+					successMessage: form.settings.successMessage ?? "Thank you! Your submission has been received.",
+				};
+			},
+		},
 
-				// Honeypot check — if the hidden field has content, it's a bot
-				if (input._hp_website && input._hp_website.length > 0) {
-					// Return success to not tip off the bot, but don't store
-					ctx.log.info("Honeypot triggered, discarding submission");
-					return { success: true, id: generateId() };
+		"storefront/submit": {
+			public: true,
+			input: submitSchema,
+			handler: async (routeCtx: { input: z.infer<typeof submitSchema> }, ctx: PluginContext) => {
+				const { formSlug, data, _hp_website } = routeCtx.input;
+
+				// Honeypot
+				if (_hp_website && _hp_website.length > 0) {
+					ctx.log.info("Honeypot triggered");
+					return { success: true, id: genId() };
 				}
 
-				// Rate limiting by email
-				if (isRateLimited(`email:${input.email}`)) {
-					throw new Response(
-						JSON.stringify({ error: "Too many submissions. Please try again later." }),
-						{ status: 429, headers: { "Content-Type": "application/json" } },
-					);
-				}
+				// Find form
+				const formResult = await ctx.storage.forms!.query({ where: { slug: formSlug, status: "active" }, limit: 1 });
+				if (formResult.items.length === 0) throw404("Form not found");
+				const formItem = formResult.items[0]!;
+				const form = formItem.data as Form;
 
-				// Turnstile verification (if configured)
+				// Rate limit by form
+				if (isRateLimited(`form:${formSlug}`)) throw400("Too many submissions. Try again later.");
+
+				// Turnstile
 				const turnstileSecret = await ctx.kv.get<string>("settings:turnstileSecretKey");
 				if (turnstileSecret) {
-					const token = input["cf-turnstile-response"];
-					if (!token) {
-						throw new Response(
-							JSON.stringify({ error: "CAPTCHA verification required." }),
-							{ status: 400, headers: { "Content-Type": "application/json" } },
-						);
-					}
+					const token = routeCtx.input["cf-turnstile-response"];
+					if (!token) throw400("CAPTCHA verification required.");
 					const valid = await verifyTurnstile(token, turnstileSecret, ctx);
-					if (!valid) {
-						throw new Response(
-							JSON.stringify({ error: "CAPTCHA verification failed." }),
-							{ status: 403, headers: { "Content-Type": "application/json" } },
-						);
+					if (!valid) throw400("CAPTCHA verification failed.");
+				}
+
+				// Validate required fields
+				for (const field of form.fields) {
+					if (field.required && !data[field.id]) {
+						throw400(`${field.label} is required`);
 					}
 				}
 
-				// Strip spam protection fields before storing
-				const { _hp_website: _, "cf-turnstile-response": __, ...cleanInput } = input;
+				// Extract email if present
+				const emailField = form.fields.find((f) => f.type === "email");
+				const email = emailField ? String(data[emailField.id] ?? "") : undefined;
 
-				const id = generateId();
-				const lead: Lead = {
-					...cleanInput,
+				// Rate limit by email too
+				if (email && isRateLimited(`email:${email}`)) throw400("Too many submissions. Try again later.");
+
+				// Save submission
+				const id = genId();
+				const submission: Submission = {
+					formId: formItem.id,
+					formName: form.name,
+					data,
+					email: email || undefined,
 					status: "new",
+					createdAt: now(),
+				};
+				await ctx.storage.submissions!.put(id, submission);
+
+				// Update form submission count
+				form.submissionCount = (form.submissionCount ?? 0) + 1;
+				form.updatedAt = now();
+				await ctx.storage.forms!.put(formItem.id, form);
+
+				// Notification email (fire-and-forget)
+				if (form.settings.notificationEmail) {
+					const fieldLines = form.fields
+						.map((f) => `${f.label}: ${data[f.id] ?? "(empty)"}`)
+						.join("\n");
+
+					sendEmail(ctx, form.settings.notificationEmail,
+						`New submission: ${form.name}`,
+						`New submission on "${form.name}":\n\n${fieldLines}\n\nView in admin: /_emdash/admin/plugins/forms/submissions`,
+					).catch(() => {});
+				}
+
+				// Auto-responder (Pro)
+				if (email && form.settings.autoResponder) {
+					isPro(ctx).then((pro) => {
+						if (pro) {
+							sendEmail(ctx, email, form.settings.autoResponder!.subject, form.settings.autoResponder!.body).catch(() => {});
+						}
+					});
+				}
+
+				// Webhook forwarding
+				const webhookUrl = await ctx.kv.get<string>("settings:webhookUrl");
+				if (webhookUrl && ctx.http) {
+					const webhookToken = await ctx.kv.get<string>("settings:webhookToken");
+					const headers: Record<string, string> = { "Content-Type": "application/json", "X-EmDash-Event": "form:submission" };
+					if (webhookToken) headers["Authorization"] = `Bearer ${webhookToken}`;
+					ctx.http.fetch(webhookUrl, {
+						method: "POST", headers,
+						body: JSON.stringify({ event: "form:submission", form: form.name, formSlug, data, email, timestamp: now() }),
+					}).catch(() => {});
+				}
+
+				// Upsert CRM contact (Pro CRM)
+				if (email) {
+					getTier(ctx).then(async (tier) => {
+						if (tier !== "pro_crm") return;
+						const existing = await ctx.storage.contacts!.query({ where: { email }, limit: 1 });
+						if (existing.items.length > 0) {
+							const c = existing.items[0]!;
+							const contact = c.data as Contact;
+							contact.submissionCount += 1;
+							contact.lastSubmissionAt = now();
+							contact.updatedAt = now();
+							await ctx.storage.contacts!.put(c.id, contact);
+							await ctx.storage.activities!.put(genId(), {
+								contactId: c.id, type: "submission",
+								description: `Submitted "${form.name}"`, createdAt: now(),
+							});
+						} else {
+							const contactId = genId();
+							const nameField = form.fields.find((f) => f.type === "text" && f.label.toLowerCase().includes("name"));
+							await ctx.storage.contacts!.put(contactId, {
+								email, name: nameField ? String(data[nameField.id] ?? email) : email,
+								status: "new", score: 0, tags: [], source: form.name,
+								submissionCount: 1, lastSubmissionAt: now(),
+								createdAt: now(), updatedAt: now(),
+							});
+							await ctx.storage.activities!.put(genId(), {
+								contactId, type: "submission",
+								description: `First submission via "${form.name}"`, createdAt: now(),
+							});
+						}
+					}).catch(() => {});
+				}
+
+				return {
+					success: true, id,
+					message: form.settings.successMessage ?? "Thank you! Your submission has been received.",
+					redirect: form.settings.redirectUrl,
+				};
+			},
+		},
+
+		// ══════════════════════════════════════════
+		// ADMIN — FORMS
+		// ══════════════════════════════════════════
+
+		"forms/list": {
+			handler: async (_routeCtx: unknown, ctx: PluginContext) => {
+				const result = await ctx.storage.forms!.query({ orderBy: { createdAt: "desc" }, limit: 100 });
+				return { items: result.items.map((i: { id: string; data: unknown }) => ({ id: i.id, ...(i.data as Form) })) };
+			},
+		},
+
+		"forms/create": {
+			input: formCreateSchema,
+			handler: async (routeCtx: { input: z.infer<typeof formCreateSchema> }, ctx: PluginContext) => {
+				const existing = await ctx.storage.forms!.query({ where: { slug: routeCtx.input.slug }, limit: 1 });
+				if (existing.items.length > 0) throw400("A form with this slug already exists");
+
+				if (routeCtx.input.autoResponderSubject || routeCtx.input.autoResponderBody) {
+					const pro = await isPro(ctx);
+					requirePro(pro, "Auto-responder emails");
+				}
+
+				const id = genId();
+				const form: Form = {
+					name: routeCtx.input.name,
+					slug: routeCtx.input.slug,
+					description: routeCtx.input.description,
+					fields: routeCtx.input.fields,
+					status: routeCtx.input.status,
+					settings: {
+						notificationEmail: routeCtx.input.notificationEmail,
+						redirectUrl: routeCtx.input.redirectUrl,
+						successMessage: routeCtx.input.successMessage,
+						autoResponder: routeCtx.input.autoResponderSubject ? {
+							subject: routeCtx.input.autoResponderSubject,
+							body: routeCtx.input.autoResponderBody ?? "",
+						} : undefined,
+					},
+					submissionCount: 0,
 					createdAt: now(),
 					updatedAt: now(),
 				};
-
-				await ctx.storage.leads!.put(id, lead);
-				await logActivity(ctx, id, "created", `Lead captured from ${lead.source}`);
-
-				// Fire-and-forget notifications
-				notifyNewLead(lead, ctx).catch((err) =>
-					ctx.log.warn("Email notification failed", err),
-				);
-				forwardToWebhook(lead, ctx).catch((err) =>
-					ctx.log.warn("Webhook forward failed", err),
-				);
-
+				await ctx.storage.forms!.put(id, form);
 				return { success: true, id };
 			},
 		},
 
-		// ── Admin: List Leads ──
+		"forms/update": {
+			input: formUpdateSchema,
+			handler: async (routeCtx: { input: z.infer<typeof formUpdateSchema> }, ctx: PluginContext) => {
+				const { id, ...updates } = routeCtx.input;
+				const existing = (await ctx.storage.forms!.get(id)) as Form | null;
+				if (!existing) throw404("Form not found");
 
-		list: {
+				const updated = { ...existing };
+				if (updates.name) updated.name = updates.name;
+				if (updates.slug) updated.slug = updates.slug;
+				if (updates.description !== undefined) updated.description = updates.description;
+				if (updates.fields) updated.fields = updates.fields;
+				if (updates.status) updated.status = updates.status;
+				if (updates.notificationEmail !== undefined) updated.settings.notificationEmail = updates.notificationEmail;
+				if (updates.redirectUrl !== undefined) updated.settings.redirectUrl = updates.redirectUrl;
+				if (updates.successMessage !== undefined) updated.settings.successMessage = updates.successMessage;
+				updated.updatedAt = now();
+
+				await ctx.storage.forms!.put(id, updated);
+				return { success: true };
+			},
+		},
+
+		"forms/delete": {
+			input: idSchema,
+			handler: async (routeCtx: { input: { id: string } }, ctx: PluginContext) => {
+				await ctx.storage.forms!.delete(routeCtx.input.id);
+				return { success: true };
+			},
+		},
+
+		// ══════════════════════════════════════════
+		// ADMIN — SUBMISSIONS
+		// ══════════════════════════════════════════
+
+		"submissions/list": {
 			input: listSchema,
 			handler: async (routeCtx: { input: z.infer<typeof listSchema> }, ctx: PluginContext) => {
-				const { status, source, assignee, limit, cursor } = routeCtx.input;
+				const { limit, cursor, status, formId } = routeCtx.input;
 				const where: Record<string, unknown> = {};
 				if (status) where.status = status;
-				if (source) where.source = source;
-				if (assignee) where.assignee = assignee;
+				if (formId) where.formId = formId;
 
-				const result = await ctx.storage.leads!.query({
+				const result = await ctx.storage.submissions!.query({
 					where: Object.keys(where).length > 0 ? where : undefined,
-					orderBy: { createdAt: "desc" },
-					limit,
-					cursor,
+					orderBy: { createdAt: "desc" }, limit, cursor,
 				});
-
 				return {
-					items: result.items.map((item: { id: string; data: unknown }) => ({
-						id: item.id,
-						...(item.data as Lead),
-					})),
-					cursor: result.cursor,
-					hasMore: result.hasMore,
+					items: result.items.map((i: { id: string; data: unknown }) => ({ id: i.id, ...(i.data as Submission) })),
+					cursor: result.cursor, hasMore: result.hasMore,
 				};
 			},
 		},
 
-		// ── Admin: Get Lead ──
+		"submissions/get": {
+			input: idSchema,
+			handler: async (routeCtx: { input: { id: string } }, ctx: PluginContext) => {
+				const sub = (await ctx.storage.submissions!.get(routeCtx.input.id)) as Submission | null;
+				if (!sub) throw404("Submission not found");
 
-		get: {
-			input: getSchema,
-			handler: async (routeCtx: { input: z.infer<typeof getSchema> }, ctx: PluginContext) => {
-				const lead = await ctx.storage.leads!.get(routeCtx.input.id);
-				if (!lead) {
-					throw new Response(JSON.stringify({ error: "Lead not found" }), {
-						status: 404,
-						headers: { "Content-Type": "application/json" },
-					});
+				// Mark as read
+				if (sub.status === "new") {
+					sub.status = "read";
+					await ctx.storage.submissions!.put(routeCtx.input.id, sub);
 				}
-
-				const activities = await ctx.storage.activities!.query({
-					where: { leadId: routeCtx.input.id },
-					orderBy: { createdAt: "desc" },
-					limit: 50,
-				});
-
-				return {
-					id: routeCtx.input.id,
-					...(lead as Lead),
-					activities: activities.items.map((a: { id: string; data: unknown }) => ({
-						id: a.id,
-						...(a.data as Activity),
-					})),
-				};
+				return { id: routeCtx.input.id, ...sub };
 			},
 		},
 
-		// ── Admin: Update Lead ──
-
-		update: {
-			input: updateSchema,
-			handler: async (routeCtx: { input: z.infer<typeof updateSchema> }, ctx: PluginContext) => {
-				const { id, ...updates } = routeCtx.input;
-				const existing = (await ctx.storage.leads!.get(id)) as Lead | null;
-				if (!existing) {
-					throw new Response(JSON.stringify({ error: "Lead not found" }), {
-						status: 404,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				const updated: Lead = { ...existing, ...updates, updatedAt: now() };
-				await ctx.storage.leads!.put(id, updated);
-
-				if (updates.status && updates.status !== existing.status) {
-					await logActivity(ctx, id, "status_change", `Status changed: ${existing.status} → ${updates.status}`);
-				}
-				if (updates.assignee && updates.assignee !== existing.assignee) {
-					await logActivity(ctx, id, "assignment", `Assigned to ${updates.assignee}`);
-				}
-
-				return { success: true, lead: { id, ...updated } };
-			},
-		},
-
-		// ── Admin: Add Note ──
-
-		"notes/add": {
-			input: addNoteSchema,
-			handler: async (routeCtx: { input: z.infer<typeof addNoteSchema> }, ctx: PluginContext) => {
-				const existing = await ctx.storage.leads!.get(routeCtx.input.leadId);
-				if (!existing) {
-					throw new Response(JSON.stringify({ error: "Lead not found" }), {
-						status: 404,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				await logActivity(ctx, routeCtx.input.leadId, "note", routeCtx.input.note);
+		"submissions/update": {
+			input: z.object({ id: z.string().min(1), status: z.enum(["new", "read", "starred", "archived", "spam"]) }),
+			handler: async (routeCtx: { input: { id: string; status: string } }, ctx: PluginContext) => {
+				const sub = (await ctx.storage.submissions!.get(routeCtx.input.id)) as Submission | null;
+				if (!sub) throw404("Submission not found");
+				sub.status = routeCtx.input.status as Submission["status"];
+				await ctx.storage.submissions!.put(routeCtx.input.id, sub);
 				return { success: true };
 			},
 		},
 
-		// ── Admin: Delete Lead ──
-
-		delete: {
-			input: deleteSchema,
-			handler: async (routeCtx: { input: z.infer<typeof deleteSchema> }, ctx: PluginContext) => {
-				const existed = await ctx.storage.leads!.exists(routeCtx.input.id);
-				if (!existed) {
-					throw new Response(JSON.stringify({ error: "Lead not found" }), {
-						status: 404,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				await ctx.storage.leads!.delete(routeCtx.input.id);
-
-				const activities = await ctx.storage.activities!.query({
-					where: { leadId: routeCtx.input.id },
-					limit: 1000,
-				});
-				if (activities.items.length > 0) {
-					await ctx.storage.activities!.deleteMany(
-						activities.items.map((a: { id: string }) => a.id),
-					);
-				}
-
+		"submissions/delete": {
+			input: idSchema,
+			handler: async (routeCtx: { input: { id: string } }, ctx: PluginContext) => {
+				await ctx.storage.submissions!.delete(routeCtx.input.id);
 				return { success: true };
 			},
 		},
 
-		// ── Admin: Export ──
-
-		export: {
+		"submissions/export": {
 			input: exportSchema,
 			handler: async (routeCtx: { input: z.infer<typeof exportSchema> }, ctx: PluginContext) => {
-				const where = routeCtx.input.status ? { status: routeCtx.input.status } : undefined;
-				const allLeads: Array<{ id: string; data: Lead }> = [];
-				let cursor: string | undefined;
+				const where: Record<string, unknown> = {};
+				if (routeCtx.input.formId) where.formId = routeCtx.input.formId;
+				if (routeCtx.input.status) where.status = routeCtx.input.status;
 
+				const all: Array<{ id: string; data: Submission }> = [];
+				let cursor: string | undefined;
 				do {
-					const result = await ctx.storage.leads!.query({
-						where,
-						orderBy: { createdAt: "desc" },
-						limit: 100,
-						cursor,
+					const result = await ctx.storage.submissions!.query({
+						where: Object.keys(where).length > 0 ? where : undefined,
+						orderBy: { createdAt: "desc" }, limit: 100, cursor,
 					});
-					allLeads.push(...(result.items as Array<{ id: string; data: Lead }>));
+					all.push(...(result.items as Array<{ id: string; data: Submission }>));
 					cursor = result.cursor;
 				} while (cursor);
 
 				if (routeCtx.input.format === "json") {
-					return {
-						data: allLeads.map((l) => ({ id: l.id, ...l.data })),
-						count: allLeads.length,
-					};
+					return { data: all.map((s) => ({ id: s.id, ...s.data })), count: all.length };
 				}
 
-				const headers = ["id", "name", "email", "phone", "company", "source", "status", "assignee", "score", "message", "createdAt", "updatedAt"];
-				const rows = allLeads.map((l) => {
-					const d = l.data;
-					return [l.id, d.name, d.email, d.phone, d.company, d.source, d.status, d.assignee, d.score, d.message, d.createdAt, d.updatedAt]
-						.map(escapeCsv)
-						.join(",");
+				// CSV: collect all unique field keys
+				const allKeys = new Set<string>();
+				for (const s of all) {
+					for (const key of Object.keys(s.data.data)) allKeys.add(key);
+				}
+				const keys = ["id", "form", "email", "status", "createdAt", ...allKeys];
+				const rows = all.map((s) => {
+					const d = s.data;
+					return [s.id, d.formName, d.email ?? "", d.status, d.createdAt, ...([...allKeys].map((k) => d.data[k]))].map(escapeCsv).join(",");
+				});
+
+				return { csv: [keys.join(","), ...rows].join("\n"), count: all.length };
+			},
+		},
+
+		// ══════════════════════════════════════════
+		// ADMIN — CRM (Pro CRM)
+		// ══════════════════════════════════════════
+
+		"contacts/list": {
+			input: listSchema,
+			handler: async (routeCtx: { input: z.infer<typeof listSchema> }, ctx: PluginContext) => {
+				const tier = await getTier(ctx);
+				requireCRM(tier, "CRM contacts");
+
+				const { limit, cursor, status } = routeCtx.input;
+				const where = status ? { status } : undefined;
+				const result = await ctx.storage.contacts!.query({ where, orderBy: { createdAt: "desc" }, limit, cursor });
+				return {
+					items: result.items.map((i: { id: string; data: unknown }) => ({ id: i.id, ...(i.data as Contact) })),
+					cursor: result.cursor, hasMore: result.hasMore,
+				};
+			},
+		},
+
+		"contacts/get": {
+			input: idSchema,
+			handler: async (routeCtx: { input: { id: string } }, ctx: PluginContext) => {
+				const tier = await getTier(ctx);
+				requireCRM(tier, "CRM contacts");
+
+				const contact = (await ctx.storage.contacts!.get(routeCtx.input.id)) as Contact | null;
+				if (!contact) throw404("Contact not found");
+
+				const activities = await ctx.storage.activities!.query({
+					where: { contactId: routeCtx.input.id }, orderBy: { createdAt: "desc" }, limit: 50,
 				});
 
 				return {
-					csv: [headers.join(","), ...rows].join("\n"),
-					count: allLeads.length,
+					id: routeCtx.input.id, ...contact,
+					activities: activities.items.map((a: { id: string; data: unknown }) => ({ id: a.id, ...(a.data as Activity) })),
 				};
 			},
 		},
 
-		// ── Admin: Pipeline Stats ──
+		"contacts/update": {
+			input: contactUpdateSchema,
+			handler: async (routeCtx: { input: z.infer<typeof contactUpdateSchema> }, ctx: PluginContext) => {
+				const tier = await getTier(ctx);
+				requireCRM(tier, "CRM contacts");
+
+				const { id, ...updates } = routeCtx.input;
+				const existing = (await ctx.storage.contacts!.get(id)) as Contact | null;
+				if (!existing) throw404("Contact not found");
+
+				const updated = { ...existing, ...updates, updatedAt: now() };
+				await ctx.storage.contacts!.put(id, updated);
+
+				if (updates.status && updates.status !== existing.status) {
+					await ctx.storage.activities!.put(genId(), {
+						contactId: id, type: "status_change",
+						description: `${existing.status} → ${updates.status}`, createdAt: now(),
+					});
+				}
+				if (updates.assignee && updates.assignee !== existing.assignee) {
+					await ctx.storage.activities!.put(genId(), {
+						contactId: id, type: "assignment",
+						description: `Assigned to ${updates.assignee}`, createdAt: now(),
+					});
+				}
+				if (updates.score !== undefined && updates.score !== existing.score) {
+					await ctx.storage.activities!.put(genId(), {
+						contactId: id, type: "score_change",
+						description: `Score: ${existing.score} → ${updates.score}`, createdAt: now(),
+					});
+				}
+
+				return { success: true };
+			},
+		},
+
+		"contacts/notes/add": {
+			input: noteSchema,
+			handler: async (routeCtx: { input: z.infer<typeof noteSchema> }, ctx: PluginContext) => {
+				const tier = await getTier(ctx);
+				requireCRM(tier, "CRM contacts");
+
+				const exists = await ctx.storage.contacts!.exists(routeCtx.input.contactId);
+				if (!exists) throw404("Contact not found");
+
+				await ctx.storage.activities!.put(genId(), {
+					contactId: routeCtx.input.contactId, type: "note",
+					description: routeCtx.input.note, createdAt: now(),
+				});
+				return { success: true };
+			},
+		},
+
+		// ══════════════════════════════════════════
+		// ADMIN — STATS & ANALYTICS
+		// ══════════════════════════════════════════
 
 		stats: {
 			handler: async (_routeCtx: unknown, ctx: PluginContext) => {
-				const [newCount, contacted, qualified, converted, lost, total] = await Promise.all([
-					ctx.storage.leads!.count({ status: "new" }),
-					ctx.storage.leads!.count({ status: "contacted" }),
-					ctx.storage.leads!.count({ status: "qualified" }),
-					ctx.storage.leads!.count({ status: "converted" }),
-					ctx.storage.leads!.count({ status: "lost" }),
-					ctx.storage.leads!.count(),
+				const [totalForms, activeForms, totalSubmissions, newSubmissions, totalContacts] = await Promise.all([
+					ctx.storage.forms!.count(),
+					ctx.storage.forms!.count({ status: "active" }),
+					ctx.storage.submissions!.count(),
+					ctx.storage.submissions!.count({ status: "new" }),
+					ctx.storage.contacts!.count(),
 				]);
-
-				const conversionRate = total > 0 ? Math.round((converted / total) * 100) : 0;
-
-				return {
-					pipeline: { new: newCount, contacted, qualified, converted, lost },
-					total,
-					conversionRate,
-				};
+				return { forms: { total: totalForms, active: activeForms }, submissions: { total: totalSubmissions, new: newSubmissions }, contacts: totalContacts };
 			},
 		},
 
-		// ── Admin: Test Email ──
-
-		"test-email": {
+		"analytics/summary": {
 			handler: async (_routeCtx: unknown, ctx: PluginContext) => {
-				const notifyEmail = await ctx.kv.get<string>("settings:notificationEmail");
-				if (!notifyEmail) {
-					return { success: false, error: "No notification email configured" };
+				const pro = await isPro(ctx);
+				requirePro(pro, "Analytics");
+
+				// Last 30 days of submissions by day
+				const days: Array<{ date: string; count: number }> = [];
+				for (let i = 29; i >= 0; i--) {
+					const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
+					const dateStr = d.toISOString().slice(0, 10);
+					const dayStart = dateStr + "T00:00:00.000Z";
+					const dayEnd = dateStr + "T23:59:59.999Z";
+					const result = await ctx.storage.submissions!.query({
+						where: { createdAt: { gte: dayStart, lte: dayEnd } }, limit: 1,
+					});
+					// count is approximate from the query — use count() for accuracy
+					days.push({ date: dateStr, count: result.items.length });
 				}
 
-				const tier = await getEmailTier(ctx);
-				if (tier === "none") {
-					return { success: false, error: "No email provider configured. Add a Resend API key or Pro license key in settings." };
-				}
+				// Top forms
+				const forms = await ctx.storage.forms!.query({ orderBy: { createdAt: "desc" }, limit: 20 });
+				const topForms = (forms.items as Array<{ id: string; data: Form }>)
+					.map((f) => ({ name: f.data.name, submissions: f.data.submissionCount ?? 0 }))
+					.sort((a, b) => b.submissions - a.submissions)
+					.slice(0, 5);
 
-				const sent = await sendEmail(
-					ctx,
-					notifyEmail,
-					"Test email from Leads Plugin",
-					"This is a test email to confirm your lead notification setup is working correctly.\n\nIf you received this, your email configuration is correct!",
-				);
-
-				return {
-					success: sent,
-					tier,
-					error: sent ? undefined : "Failed to send. Check your API key.",
-				};
+				return { period: "30d", daily: days, topForms };
 			},
 		},
 
-		// ── Block Kit Admin UI ──
+		// ══════════════════════════════════════════
+		// BLOCK KIT ADMIN UI
+		// ══════════════════════════════════════════
 
 		admin: {
-			handler: async (
-				routeCtx: { input: unknown },
-				ctx: PluginContext,
-			) => {
+			handler: async (routeCtx: { input: unknown }, ctx: PluginContext) => {
 				const interaction = routeCtx.input as {
-					type: string;
-					page?: string;
-					action_id?: string;
-					values?: Record<string, unknown>;
+					type: string; page?: string; action_id?: string; values?: Record<string, unknown>;
 				};
 
-				// Widget
-				if (interaction.type === "page_load" && interaction.page === "widget:pipeline-overview") {
-					return buildPipelineWidget(ctx);
-				}
+				if (interaction.type === "page_load" && interaction.page === "widget:submissions-overview") return buildSubmissionsWidget(ctx);
+				if (interaction.type === "page_load" && interaction.page === "/") return buildDashboard(ctx);
+				if (interaction.type === "page_load" && interaction.page === "/forms") return buildFormsPage(ctx);
+				if (interaction.type === "page_load" && interaction.page === "/submissions") return buildSubmissionsPage(ctx);
+				if (interaction.type === "page_load" && interaction.page === "/contacts") return buildContactsPage(ctx);
+				if (interaction.type === "page_load" && interaction.page === "/analytics") return buildAnalyticsPage(ctx);
+				if (interaction.type === "page_load" && interaction.page === "/settings") return buildSettingsPage(ctx);
 
-				// Leads List Page
-				if (interaction.type === "page_load" && interaction.page === "/") {
-					return buildLeadsPage(ctx);
-				}
+				if (interaction.type === "form_submit" && interaction.action_id === "save_settings") return saveSettings(ctx, interaction.values ?? {});
+				if (interaction.type === "form_submit" && interaction.action_id === "quick_form") return quickCreateForm(ctx, interaction.values ?? {});
 
-				// Settings Page
-				if (interaction.type === "page_load" && interaction.page === "/settings") {
-					return buildSettingsPage(ctx);
-				}
-
-				if (interaction.type === "form_submit" && interaction.action_id === "save_settings") {
-					return saveSettings(ctx, interaction.values ?? {});
-				}
-
-				// Test Email
-				if (interaction.type === "block_action" && interaction.action_id === "test_email") {
-					return testEmail(ctx);
-				}
-
-				// Lead Status Actions
-				if (interaction.type === "block_action" && interaction.action_id?.startsWith("set_status:")) {
+				// Submission status changes
+				if (interaction.type === "block_action" && interaction.action_id?.startsWith("sub_status:")) {
 					const [, id, status] = interaction.action_id.split(":");
 					if (id && status) {
-						const lead = (await ctx.storage.leads!.get(id)) as Lead | null;
-						if (lead) {
-							const oldStatus = lead.status;
-							lead.status = status as Lead["status"];
-							lead.updatedAt = now();
-							await ctx.storage.leads!.put(id, lead);
-							await logActivity(ctx, id, "status_change", `${oldStatus} → ${status}`);
+						const sub = (await ctx.storage.submissions!.get(id)) as Submission | null;
+						if (sub) {
+							sub.status = status as Submission["status"];
+							await ctx.storage.submissions!.put(id, sub);
 						}
 					}
-					return buildLeadsPage(ctx);
+					return buildSubmissionsPage(ctx);
 				}
 
-				// Delete Lead
-				if (interaction.type === "block_action" && interaction.action_id?.startsWith("delete_lead:")) {
-					const id = interaction.action_id.split(":")[1];
-					if (id) {
-						await ctx.storage.leads!.delete(id);
-						const acts = await ctx.storage.activities!.query({
-							where: { leadId: id },
-							limit: 1000,
-						});
-						if (acts.items.length > 0) {
-							await ctx.storage.activities!.deleteMany(
-								acts.items.map((a: { id: string }) => a.id),
-							);
+				// Contact status changes
+				if (interaction.type === "block_action" && interaction.action_id?.startsWith("contact_status:")) {
+					const [, id, status] = interaction.action_id.split(":");
+					if (id && status) {
+						const contact = (await ctx.storage.contacts!.get(id)) as Contact | null;
+						if (contact) {
+							const old = contact.status;
+							contact.status = status as Contact["status"];
+							contact.updatedAt = now();
+							await ctx.storage.contacts!.put(id, contact);
+							await ctx.storage.activities!.put(genId(), {
+								contactId: id, type: "status_change",
+								description: `${old} → ${status}`, createdAt: now(),
+							});
 						}
 					}
-					return {
-						...(await buildLeadsPage(ctx)),
-						toast: { message: "Lead deleted", type: "success" },
-					};
+					return buildContactsPage(ctx);
 				}
 
 				return { blocks: [] };
@@ -733,467 +837,388 @@ export default definePlugin({
 	},
 });
 
-// ── Block Kit Builders ──
+// ══════════════════════════════════════════
+// BLOCK KIT BUILDERS
+// ══════════════════════════════════════════
 
-async function buildPipelineWidget(ctx: PluginContext) {
+async function buildSubmissionsWidget(ctx: PluginContext) {
 	try {
-		const [newCount, contacted, qualified, converted, lost, total] = await Promise.all([
-			ctx.storage.leads!.count({ status: "new" }),
-			ctx.storage.leads!.count({ status: "contacted" }),
-			ctx.storage.leads!.count({ status: "qualified" }),
-			ctx.storage.leads!.count({ status: "converted" }),
-			ctx.storage.leads!.count({ status: "lost" }),
-			ctx.storage.leads!.count(),
-		]);
-
-		const conversionRate = total > 0 ? Math.round((converted / total) * 100) : 0;
-
+		const result = await ctx.storage.submissions!.query({ orderBy: { createdAt: "desc" }, limit: 5 });
+		const newCount = await ctx.storage.submissions!.count({ status: "new" });
+		if (result.items.length === 0) return { blocks: [{ type: "context", text: "No submissions yet" }] };
 		return {
 			blocks: [
+				{ type: "stats", stats: [{ label: "Unread", value: String(newCount) }] },
 				{
-					type: "stats",
-					stats: [
-						{ label: "New", value: String(newCount) },
-						{ label: "Qualified", value: String(qualified) },
-						{ label: "Converted", value: String(converted), trend: `${conversionRate}%`, trend_direction: "up" as const },
-						{ label: "Total", value: String(total) },
+					type: "table",
+					columns: [
+						{ key: "form", label: "Form" }, { key: "email", label: "Email" },
+						{ key: "status", label: "Status", format: "badge" },
+						{ key: "date", label: "Date", format: "relative_time" },
 					],
-				},
-				{
-					type: "meter",
-					label: "Pipeline",
-					value: total > 0 ? Math.round(((newCount + contacted + qualified) / total) * 100) : 0,
-					custom_value: `${newCount + contacted + qualified} active / ${total} total`,
+					rows: result.items.map((i: { data: unknown }) => {
+						const s = i.data as Submission;
+						return { form: s.formName, email: s.email ?? "-", status: s.status, date: s.createdAt };
+					}),
 				},
 			],
 		};
-	} catch (error) {
-		ctx.log.error("Failed to build pipeline widget", error);
-		return { blocks: [{ type: "context", text: "Failed to load pipeline data" }] };
-	}
+	} catch { return { blocks: [{ type: "context", text: "Failed to load" }] }; }
 }
 
-async function buildLeadsPage(ctx: PluginContext) {
+async function buildDashboard(ctx: PluginContext) {
 	try {
-		// Check email config and show banner if needed
-		const tier = await getEmailTier(ctx);
-		const notifyEmail = await ctx.kv.get<string>("settings:notificationEmail");
-
-		const result = await ctx.storage.leads!.query({
-			orderBy: { createdAt: "desc" },
-			limit: 50,
-		});
-
-		const leads = result.items as Array<{ id: string; data: Lead }>;
-
-		const [newCount, contacted, qualified, converted, total] = await Promise.all([
-			ctx.storage.leads!.count({ status: "new" }),
-			ctx.storage.leads!.count({ status: "contacted" }),
-			ctx.storage.leads!.count({ status: "qualified" }),
-			ctx.storage.leads!.count({ status: "converted" }),
-			ctx.storage.leads!.count(),
+		const tier = await getTier(ctx);
+		const [activeForms, totalSubmissions, newSubmissions, totalContacts] = await Promise.all([
+			ctx.storage.forms!.count({ status: "active" }),
+			ctx.storage.submissions!.count(),
+			ctx.storage.submissions!.count({ status: "new" }),
+			ctx.storage.contacts!.count(),
 		]);
 
-		const blocks: unknown[] = [
-			{ type: "header", text: "Leads" },
-		];
+		const blocks: unknown[] = [{ type: "header", text: "Forms Dashboard" }];
 
-		// Email setup warning
-		if (tier === "none" && notifyEmail) {
-			blocks.push({
-				type: "banner",
-				variant: "alert",
-				title: "Email notifications not configured",
-				description: "You have a notification email set but no email provider. Go to Settings and add a Resend API key (free) or upgrade to Pro for managed email.",
-			});
-		} else if (tier === "none" && !notifyEmail) {
-			blocks.push({
-				type: "banner",
-				variant: "default",
-				title: "Set up email notifications",
-				description: "Get notified instantly when new leads come in. Go to Settings to configure.",
-			});
+		if (tier === "free") {
+			blocks.push({ type: "banner", variant: "default", title: "Upgrade to Pro", description: "Get managed email, auto-responders, and analytics ($10/mo). Or Pro CRM ($29/mo) for lead pipeline, scoring, and contact management. pluginsforemdash.com/pricing" });
 		}
 
-		blocks.push(
+		const stats = [
+			{ label: "Active Forms", value: String(activeForms) },
+			{ label: "Total Submissions", value: formatNum(totalSubmissions) },
+			{ label: "Unread", value: String(newSubmissions) },
+		];
+		if (tier === "pro_crm") stats.push({ label: "Contacts", value: formatNum(totalContacts) });
+		blocks.push({ type: "stats", stats });
+
+		if (newSubmissions > 0) {
+			blocks.push({ type: "banner", variant: "default", title: `${newSubmissions} unread submission${newSubmissions > 1 ? "s" : ""}`, description: "Go to Submissions to review them." });
+		}
+
+		// Recent submissions
+		const recent = await ctx.storage.submissions!.query({ orderBy: { createdAt: "desc" }, limit: 10 });
+		if (recent.items.length > 0) {
+			blocks.push(
+				{ type: "divider" },
+				{ type: "section", text: "**Recent Submissions**" },
+				{
+					type: "table",
+					columns: [
+						{ key: "form", label: "Form" }, { key: "email", label: "Email" },
+						{ key: "status", label: "Status", format: "badge" },
+						{ key: "date", label: "Date", format: "relative_time" },
+					],
+					rows: recent.items.map((i: { data: unknown }) => {
+						const s = i.data as Submission;
+						return { form: s.formName, email: s.email ?? "-", status: s.status, date: s.createdAt };
+					}),
+				},
+			);
+		}
+
+		return { blocks };
+	} catch (error) { ctx.log.error("Dashboard error", error); return { blocks: [{ type: "context", text: "Failed to load" }] }; }
+}
+
+async function buildFormsPage(ctx: PluginContext) {
+	try {
+		const result = await ctx.storage.forms!.query({ orderBy: { createdAt: "desc" }, limit: 50 });
+		const forms = result.items as Array<{ id: string; data: Form }>;
+
+		const blocks: unknown[] = [
+			{ type: "header", text: "Forms" },
 			{
-				type: "stats",
-				stats: [
-					{ label: "New", value: String(newCount) },
-					{ label: "Contacted", value: String(contacted) },
-					{ label: "Qualified", value: String(qualified) },
-					{ label: "Converted", value: String(converted) },
-					{ label: "Total", value: String(total) },
+				type: "form", block_id: "quick-form",
+				fields: [
+					{ type: "text_input", action_id: "name", label: "Form Name" },
+					{ type: "text_input", action_id: "slug", label: "URL Slug" },
+					{ type: "text_input", action_id: "notificationEmail", label: "Notification Email (optional)" },
+					{ type: "select", action_id: "template", label: "Template", options: [
+						{ label: "Contact Form (name, email, message)", value: "contact" },
+						{ label: "Feedback (name, email, rating, comments)", value: "feedback" },
+						{ label: "Newsletter Signup (email only)", value: "newsletter" },
+						{ label: "Blank (add fields via API)", value: "blank" },
+					] },
 				],
+				submit: { label: "Create Form", action_id: "quick_form" },
 			},
 			{ type: "divider" },
-		);
+		];
 
-		if (leads.length === 0) {
-			blocks.push({
-				type: "context",
-				text: "No leads yet. Embed the capture form or POST to /_emdash/api/plugins/leads/capture to start collecting leads.",
-			});
+		if (forms.length === 0) {
+			blocks.push({ type: "context", text: "No forms yet. Create your first form above." });
 		} else {
 			blocks.push({
 				type: "table",
-				block_id: "leads-table",
 				columns: [
-					{ key: "name", label: "Name" },
-					{ key: "email", label: "Email" },
-					{ key: "company", label: "Company" },
-					{ key: "source", label: "Source" },
+					{ key: "name", label: "Name" }, { key: "slug", label: "Slug" },
+					{ key: "fields", label: "Fields" }, { key: "submissions", label: "Submissions" },
 					{ key: "status", label: "Status", format: "badge" },
-					{ key: "createdAt", label: "Created", format: "relative_time" },
 				],
-				rows: leads.map((l) => ({
-					_id: l.id,
-					name: l.data.name,
-					email: l.data.email,
-					company: l.data.company ?? "-",
-					source: l.data.source,
-					status: l.data.status,
-					createdAt: l.data.createdAt,
+				rows: forms.map((f) => ({
+					name: f.data.name, slug: f.data.slug, fields: String(f.data.fields.length),
+					submissions: formatNum(f.data.submissionCount ?? 0), status: f.data.status,
 				})),
 			});
 
-			for (const l of leads.slice(0, 10)) {
-				if (l.data.status === "new") {
-					blocks.push({
-						type: "actions",
-						elements: [
-							{
-								type: "button",
-								text: `Mark "${l.data.name}" Contacted`,
-								action_id: `set_status:${l.id}:contacted`,
-							},
-							{
-								type: "button",
-								text: "Delete",
-								action_id: `delete_lead:${l.id}`,
-								style: "danger",
-								confirm: {
-									title: "Delete Lead?",
-									text: `This will permanently delete ${l.data.name} and all their activity history.`,
-									confirm: "Delete",
-									deny: "Cancel",
-								},
-							},
-						],
-					});
+			// Embed code for each active form
+			for (const f of forms.filter((f) => f.data.status === "active").slice(0, 3)) {
+				blocks.push(
+					{ type: "context", text: `Embed code for "${f.data.name}":` },
+					{ type: "code", code: `POST /_emdash/api/plugins/forms/storefront/submit\n{ "formSlug": "${f.data.slug}", "data": { ... } }`, language: "bash" as never },
+				);
+			}
+		}
+
+		return { blocks };
+	} catch (error) { ctx.log.error("Forms page error", error); return { blocks: [{ type: "context", text: "Failed to load" }] }; }
+}
+
+async function buildSubmissionsPage(ctx: PluginContext) {
+	try {
+		const result = await ctx.storage.submissions!.query({ orderBy: { createdAt: "desc" }, limit: 50 });
+		const submissions = result.items as Array<{ id: string; data: Submission }>;
+
+		const blocks: unknown[] = [{ type: "header", text: "Submissions" }];
+
+		if (submissions.length === 0) {
+			blocks.push({ type: "context", text: "No submissions yet." });
+		} else {
+			blocks.push({
+				type: "table",
+				columns: [
+					{ key: "form", label: "Form" }, { key: "email", label: "Email" },
+					{ key: "status", label: "Status", format: "badge" },
+					{ key: "date", label: "Date", format: "relative_time" },
+				],
+				rows: submissions.map((s) => ({
+					_id: s.id, form: s.data.formName, email: s.data.email ?? "-",
+					status: s.data.status, date: s.data.createdAt,
+				})),
+			});
+
+			for (const s of submissions.slice(0, 5)) {
+				if (s.data.status === "new") {
+					blocks.push({ type: "actions", elements: [
+						{ type: "button", text: `Mark Read`, action_id: `sub_status:${s.id}:read` },
+						{ type: "button", text: "Star", action_id: `sub_status:${s.id}:starred` },
+						{ type: "button", text: "Spam", action_id: `sub_status:${s.id}:spam`, style: "danger" },
+					]});
 				}
 			}
 		}
 
 		return { blocks };
-	} catch (error) {
-		ctx.log.error("Failed to build leads page", error);
-		return { blocks: [{ type: "context", text: "Failed to load leads" }] };
+	} catch (error) { ctx.log.error("Submissions error", error); return { blocks: [{ type: "context", text: "Failed to load" }] }; }
+}
+
+async function buildContactsPage(ctx: PluginContext) {
+	const tier = await getTier(ctx);
+	if (tier !== "pro_crm") {
+		return {
+			blocks: [
+				{ type: "header", text: "CRM Contacts" },
+				{ type: "banner", variant: "alert", title: "Pro CRM feature", description: "Lead pipeline, scoring, assignment, and contact management requires Pro CRM ($29/mo). Upgrade at pluginsforemdash.com/pricing" },
+			],
+		};
 	}
+
+	try {
+		const result = await ctx.storage.contacts!.query({ orderBy: { createdAt: "desc" }, limit: 50 });
+		const contacts = result.items as Array<{ id: string; data: Contact }>;
+
+		const [newCount, contacted, qualified, converted] = await Promise.all([
+			ctx.storage.contacts!.count({ status: "new" }),
+			ctx.storage.contacts!.count({ status: "contacted" }),
+			ctx.storage.contacts!.count({ status: "qualified" }),
+			ctx.storage.contacts!.count({ status: "converted" }),
+		]);
+
+		const blocks: unknown[] = [
+			{ type: "header", text: "CRM Contacts" },
+			{ type: "stats", stats: [
+				{ label: "New", value: String(newCount) }, { label: "Contacted", value: String(contacted) },
+				{ label: "Qualified", value: String(qualified) }, { label: "Converted", value: String(converted) },
+			]},
+			{ type: "divider" },
+		];
+
+		if (contacts.length === 0) {
+			blocks.push({ type: "context", text: "No contacts yet. Contacts are created automatically from form submissions with email fields." });
+		} else {
+			blocks.push({
+				type: "table",
+				columns: [
+					{ key: "name", label: "Name" }, { key: "email", label: "Email" },
+					{ key: "source", label: "Source" }, { key: "score", label: "Score" },
+					{ key: "submissions", label: "Submissions" },
+					{ key: "status", label: "Status", format: "badge" },
+				],
+				rows: contacts.map((c) => ({
+					_id: c.id, name: c.data.name, email: c.data.email,
+					source: c.data.source ?? "-", score: String(c.data.score),
+					submissions: String(c.data.submissionCount), status: c.data.status,
+				})),
+			});
+
+			for (const c of contacts.slice(0, 5)) {
+				if (c.data.status === "new") {
+					blocks.push({ type: "actions", elements: [
+						{ type: "button", text: `Mark "${c.data.name}" Contacted`, action_id: `contact_status:${c.id}:contacted` },
+					]});
+				}
+			}
+		}
+
+		return { blocks };
+	} catch (error) { ctx.log.error("Contacts error", error); return { blocks: [{ type: "context", text: "Failed to load" }] }; }
+}
+
+async function buildAnalyticsPage(ctx: PluginContext) {
+	const pro = await isPro(ctx);
+	if (!pro) {
+		return {
+			blocks: [
+				{ type: "header", text: "Analytics" },
+				{ type: "banner", variant: "alert", title: "Pro feature", description: "Submission analytics requires Pro ($10/mo) or Pro CRM ($29/mo). Upgrade at pluginsforemdash.com/pricing" },
+			],
+		};
+	}
+
+	try {
+		const totalSubmissions = await ctx.storage.submissions!.count();
+		const activeForms = await ctx.storage.forms!.count({ status: "active" });
+
+		const forms = await ctx.storage.forms!.query({ orderBy: { createdAt: "desc" }, limit: 20 });
+		const topForms = (forms.items as Array<{ id: string; data: Form }>)
+			.map((f) => ({ name: f.data.name, count: f.data.submissionCount ?? 0 }))
+			.sort((a, b) => b.count - a.count)
+			.slice(0, 5);
+
+		const blocks: unknown[] = [
+			{ type: "header", text: "Analytics" },
+			{ type: "stats", stats: [
+				{ label: "Total Submissions", value: formatNum(totalSubmissions) },
+				{ label: "Active Forms", value: String(activeForms) },
+			]},
+			{ type: "divider" },
+		];
+
+		if (topForms.length > 0) {
+			blocks.push(
+				{ type: "section", text: "**Top Forms by Submissions**" },
+				{
+					type: "table",
+					columns: [{ key: "name", label: "Form" }, { key: "count", label: "Submissions" }],
+					rows: topForms.map((f) => ({ name: f.name, count: formatNum(f.count) })),
+				},
+			);
+		}
+
+		return { blocks };
+	} catch (error) { ctx.log.error("Analytics error", error); return { blocks: [{ type: "context", text: "Failed to load" }] }; }
 }
 
 async function buildSettingsPage(ctx: PluginContext) {
 	try {
-		const notificationEmail = (await ctx.kv.get<string>("settings:notificationEmail")) ?? "";
-		const webhookUrl = (await ctx.kv.get<string>("settings:webhookUrl")) ?? "";
-		const autoArchiveDays = (await ctx.kv.get<number>("settings:autoArchiveDays")) ?? 90;
-		const maxLeads = (await ctx.kv.get<number>("settings:maxLeads")) ?? 10000;
-		const turnstileSiteKey = (await ctx.kv.get<string>("settings:turnstileSiteKey")) ?? "";
+		const tier = await getTier(ctx);
 		const fromEmail = (await ctx.kv.get<string>("settings:fromEmail")) ?? "";
-		const tier = await getEmailTier(ctx);
+		const webhookUrl = (await ctx.kv.get<string>("settings:webhookUrl")) ?? "";
+		const turnstileSiteKey = (await ctx.kv.get<string>("settings:turnstileSiteKey")) ?? "";
 
-		const blocks: unknown[] = [
-			{ type: "header", text: "Lead Settings" },
-		];
+		const blocks: unknown[] = [{ type: "header", text: "Settings" }];
 
-		// ── Email Tier Status ──
-
-		if (tier === "pro") {
-			blocks.push({
-				type: "banner",
-				variant: "default",
-				title: "Pro Plan Active",
-				description: "Email notifications are sent via managed relay. No configuration needed.",
-			});
-		} else if (tier === "free") {
-			blocks.push({
-				type: "banner",
-				variant: "default",
-				title: "Free Plan — Using Your Resend API Key",
-				description: "Upgrade to Pro ($10/mo) for managed email delivery, higher limits, and priority support.",
-			});
+		// Tier banner
+		if (tier === "pro_crm") {
+			blocks.push({ type: "banner", variant: "default", title: "Pro CRM Active", description: "All features enabled including lead pipeline and contact management." });
+		} else if (tier === "pro") {
+			blocks.push({ type: "banner", variant: "default", title: "Pro Active", description: "Managed email and analytics enabled. Upgrade to Pro CRM ($29/mo) for lead pipeline." });
 		} else {
-			blocks.push({
-				type: "banner",
-				variant: "alert",
-				title: "Email Not Configured",
-				description: "Add a Resend API key below (free) or enter a Pro license key for managed email ($10/mo).",
-			});
+			blocks.push({ type: "banner", variant: "default", title: "Free Plan", description: "Upgrade to Pro ($10/mo) for managed email and analytics, or Pro CRM ($29/mo) for the full pipeline." });
 		}
 
-		// ── Settings Form ──
-
-		const fields: unknown[] = [
-			{
-				type: "text_input",
-				action_id: "notificationEmail",
-				label: "Notification Email",
-				initial_value: notificationEmail,
-			},
-			{
-				type: "text_input",
-				action_id: "fromEmail",
-				label: "From Email Address",
-				initial_value: fromEmail,
-			},
-		];
-
-		// Pro license key
-		fields.push({
-			type: "secret_input",
-			action_id: "licenseKey",
-			label: "Pro License Key ($10/mo managed email)",
-		});
-
-		// Free tier: own Resend key
-		fields.push({
-			type: "secret_input",
-			action_id: "resendApiKey",
-			label: "Resend API Key (free tier — bring your own)",
-		});
-
-		// Spam protection
-		fields.push(
-			{ type: "divider" },
-			{
-				type: "text_input",
-				action_id: "turnstileSiteKey",
-				label: "Turnstile Site Key (optional spam protection)",
-				initial_value: turnstileSiteKey,
-			},
-			{
-				type: "secret_input",
-				action_id: "turnstileSecretKey",
-				label: "Turnstile Secret Key",
-			},
-		);
-
-		// CRM webhook
-		fields.push(
-			{ type: "divider" },
-			{
-				type: "text_input",
-				action_id: "webhookUrl",
-				label: "CRM Webhook URL",
-				initial_value: webhookUrl,
-			},
-			{
-				type: "secret_input",
-				action_id: "webhookToken",
-				label: "Webhook Auth Token",
-			},
-		);
-
-		// Lead management
-		fields.push(
-			{ type: "divider" },
-			{
-				type: "number_input",
-				action_id: "autoArchiveDays",
-				label: "Auto-archive after (days)",
-				initial_value: autoArchiveDays,
-				min: 7,
-				max: 365,
-			},
-			{
-				type: "number_input",
-				action_id: "maxLeads",
-				label: "Maximum Leads",
-				initial_value: maxLeads,
-				min: 100,
-				max: 100000,
-			},
-		);
-
-		blocks.push(
-			{
-				type: "form",
-				block_id: "lead-settings",
-				fields,
-				submit: { label: "Save Settings", action_id: "save_settings" },
-			},
-			{ type: "divider" },
-			{
-				type: "actions",
-				elements: [
-					{
-						type: "button",
-						text: "Send Test Email",
-						action_id: "test_email",
-						style: "primary",
-					},
-				],
-			},
-		);
-
-		// ── Embed Code ──
-
-		blocks.push(
-			{ type: "divider" },
-			{ type: "header", text: "Embed Code" },
-			{
-				type: "context",
-				text: "Add this form to any page or external site. Includes honeypot spam protection automatically.",
-			},
-		);
-
-		// Build embed code based on whether Turnstile is configured
-		const hasTurnstile = !!turnstileSiteKey;
-
-		const embedCode = hasTurnstile
-			? `<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-<form id="lead-form">
-  <input name="name" placeholder="Name" required />
-  <input name="email" type="email" placeholder="Email" required />
-  <input name="phone" placeholder="Phone" />
-  <input name="company" placeholder="Company" />
-  <textarea name="message" placeholder="Message"></textarea>
-  <!-- Honeypot — hidden from humans, bots fill it -->
-  <div style="position:absolute;left:-9999px" aria-hidden="true">
-    <input name="_hp_website" tabindex="-1" autocomplete="off" />
-  </div>
-  <!-- Turnstile widget -->
-  <div class="cf-turnstile" data-sitekey="${turnstileSiteKey}"></div>
-  <button type="submit">Submit</button>
-</form>
-<script>
-  document.getElementById("lead-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const data = Object.fromEntries(new FormData(e.target));
-    data.source = "website";
-    const res = await fetch("/_emdash/api/plugins/leads/capture", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    if (res.ok) {
-      e.target.reset();
-      alert("Thank you! We'll be in touch.");
-    } else {
-      const err = await res.json().catch(() => ({}));
-      alert(err.error || "Something went wrong. Please try again.");
-    }
-  });
-</script>`
-			: `<form id="lead-form">
-  <input name="name" placeholder="Name" required />
-  <input name="email" type="email" placeholder="Email" required />
-  <input name="phone" placeholder="Phone" />
-  <input name="company" placeholder="Company" />
-  <textarea name="message" placeholder="Message"></textarea>
-  <!-- Honeypot — hidden from humans, bots fill it -->
-  <div style="position:absolute;left:-9999px" aria-hidden="true">
-    <input name="_hp_website" tabindex="-1" autocomplete="off" />
-  </div>
-  <button type="submit">Submit</button>
-</form>
-<script>
-  document.getElementById("lead-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const data = Object.fromEntries(new FormData(e.target));
-    data.source = "website";
-    const res = await fetch("/_emdash/api/plugins/leads/capture", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    if (res.ok) {
-      e.target.reset();
-      alert("Thank you! We'll be in touch.");
-    } else {
-      const err = await res.json().catch(() => ({}));
-      alert(err.error || "Something went wrong. Please try again.");
-    }
-  });
-</script>`;
-
 		blocks.push({
-			type: "code",
-			code: embedCode,
-			language: "html" as never,
+			type: "form", block_id: "settings",
+			fields: [
+				{ type: "secret_input", action_id: "licenseKey", label: "License Key (Pro $10/mo or Pro CRM $29/mo)" },
+				{ type: "select", action_id: "licenseTier", label: "License Tier", options: [
+					{ label: "Pro ($10/mo)", value: "pro" },
+					{ label: "Pro CRM ($29/mo)", value: "pro_crm" },
+				]},
+				{ type: "divider" },
+				{ type: "text_input", action_id: "fromEmail", label: "From Email Address", initial_value: fromEmail },
+				{ type: "secret_input", action_id: "resendApiKey", label: "Resend API Key (free tier)" },
+				{ type: "divider" },
+				{ type: "text_input", action_id: "turnstileSiteKey", label: "Turnstile Site Key (optional)", initial_value: turnstileSiteKey },
+				{ type: "secret_input", action_id: "turnstileSecretKey", label: "Turnstile Secret Key" },
+				{ type: "divider" },
+				{ type: "text_input", action_id: "webhookUrl", label: "Webhook URL (Zapier, Make, etc.)", initial_value: webhookUrl },
+				{ type: "secret_input", action_id: "webhookToken", label: "Webhook Auth Token" },
+			],
+			submit: { label: "Save Settings", action_id: "save_settings" },
 		});
 
 		return { blocks };
-	} catch (error) {
-		ctx.log.error("Failed to build settings page", error);
-		return { blocks: [{ type: "context", text: "Failed to load settings" }] };
-	}
+	} catch (error) { ctx.log.error("Settings error", error); return { blocks: [{ type: "context", text: "Failed to load" }] }; }
 }
 
 async function saveSettings(ctx: PluginContext, values: Record<string, unknown>) {
 	try {
-		if (typeof values.notificationEmail === "string")
-			await ctx.kv.set("settings:notificationEmail", values.notificationEmail);
-		if (typeof values.fromEmail === "string")
-			await ctx.kv.set("settings:fromEmail", values.fromEmail);
-		if (typeof values.licenseKey === "string" && values.licenseKey !== "")
-			await ctx.kv.set("settings:licenseKey", values.licenseKey);
-		if (typeof values.resendApiKey === "string" && values.resendApiKey !== "")
-			await ctx.kv.set("settings:resendApiKey", values.resendApiKey);
-		if (typeof values.turnstileSiteKey === "string")
-			await ctx.kv.set("settings:turnstileSiteKey", values.turnstileSiteKey);
-		if (typeof values.turnstileSecretKey === "string" && values.turnstileSecretKey !== "")
-			await ctx.kv.set("settings:turnstileSecretKey", values.turnstileSecretKey);
-		if (typeof values.webhookUrl === "string")
-			await ctx.kv.set("settings:webhookUrl", values.webhookUrl);
-		if (typeof values.webhookToken === "string" && values.webhookToken !== "")
-			await ctx.kv.set("settings:webhookToken", values.webhookToken);
-		if (typeof values.autoArchiveDays === "number")
-			await ctx.kv.set("settings:autoArchiveDays", values.autoArchiveDays);
-		if (typeof values.maxLeads === "number")
-			await ctx.kv.set("settings:maxLeads", values.maxLeads);
+		const secrets = ["licenseKey", "resendApiKey", "turnstileSecretKey", "webhookToken"];
+		const strings = ["fromEmail", "turnstileSiteKey", "webhookUrl", "licenseTier"];
 
-		return {
-			...(await buildSettingsPage(ctx)),
-			toast: { message: "Settings saved", type: "success" },
-		};
-	} catch (error) {
-		ctx.log.error("Failed to save settings", error);
-		return {
-			blocks: [{ type: "banner", variant: "error", title: "Failed to save settings" }],
-			toast: { message: "Failed to save settings", type: "error" },
-		};
+		for (const key of secrets) {
+			if (typeof values[key] === "string" && values[key] !== "") await ctx.kv.set(`settings:${key}`, values[key]);
+		}
+		for (const key of strings) {
+			if (typeof values[key] === "string") await ctx.kv.set(`settings:${key}`, values[key]);
+		}
+
+		return { ...(await buildSettingsPage(ctx)), toast: { message: "Settings saved", type: "success" } };
+	} catch {
+		return { blocks: [{ type: "banner", variant: "error", title: "Failed to save" }], toast: { message: "Failed", type: "error" } };
 	}
 }
 
-async function testEmail(ctx: PluginContext) {
-	const notifyEmail = await ctx.kv.get<string>("settings:notificationEmail");
-	if (!notifyEmail) {
-		return {
-			...(await buildSettingsPage(ctx)),
-			toast: { message: "Set a notification email first", type: "error" },
+async function quickCreateForm(ctx: PluginContext, values: Record<string, unknown>) {
+	try {
+		const name = values.name as string;
+		const slug = values.slug as string;
+		const template = (values.template as string) || "contact";
+
+		if (!name || !slug) return { ...(await buildFormsPage(ctx)), toast: { message: "Name and slug required", type: "error" } };
+
+		const existing = await ctx.storage.forms!.query({ where: { slug }, limit: 1 });
+		if (existing.items.length > 0) return { ...(await buildFormsPage(ctx)), toast: { message: "Slug already exists", type: "error" } };
+
+		const templates: Record<string, FormField[]> = {
+			contact: [
+				{ id: "name", type: "text", label: "Name", required: true, placeholder: "Your name" },
+				{ id: "email", type: "email", label: "Email", required: true, placeholder: "you@example.com" },
+				{ id: "message", type: "textarea", label: "Message", required: true, placeholder: "How can we help?" },
+			],
+			feedback: [
+				{ id: "name", type: "text", label: "Name", required: false, placeholder: "Your name" },
+				{ id: "email", type: "email", label: "Email", required: true, placeholder: "you@example.com" },
+				{ id: "rating", type: "select", label: "Rating", required: true, options: ["5 - Excellent", "4 - Good", "3 - Average", "2 - Poor", "1 - Terrible"] },
+				{ id: "comments", type: "textarea", label: "Comments", required: false, placeholder: "Tell us more..." },
+			],
+			newsletter: [
+				{ id: "email", type: "email", label: "Email", required: true, placeholder: "you@example.com" },
+			],
+			blank: [],
 		};
-	}
 
-	const tier = await getEmailTier(ctx);
-	if (tier === "none") {
-		return {
-			...(await buildSettingsPage(ctx)),
-			toast: { message: "Add a Resend API key or Pro license key first", type: "error" },
+		const form: Form = {
+			name, slug, fields: templates[template] ?? [],
+			status: "active",
+			settings: { notificationEmail: (values.notificationEmail as string) || undefined },
+			submissionCount: 0, createdAt: now(), updatedAt: now(),
 		};
+
+		await ctx.storage.forms!.put(genId(), form);
+		return { ...(await buildFormsPage(ctx)), toast: { message: `"${name}" created`, type: "success" } };
+	} catch (error) {
+		ctx.log.error("Create form error", error);
+		return { ...(await buildFormsPage(ctx)), toast: { message: "Failed to create form", type: "error" } };
 	}
-
-	const sent = await sendEmail(
-		ctx,
-		notifyEmail,
-		"Test email from Leads Plugin",
-		"This is a test email. If you received it, your lead notifications are working!",
-	);
-
-	return {
-		...(await buildSettingsPage(ctx)),
-		toast: sent
-			? { message: `Test email sent to ${notifyEmail} (${tier} tier)`, type: "success" }
-			: { message: "Failed to send. Check your API key.", type: "error" },
-	};
 }
