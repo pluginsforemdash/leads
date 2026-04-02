@@ -17,7 +17,7 @@
  *
  * @example
  * ```typescript
- * import { formsPlugin } from "emdash-plugin-leads";
+ * import { formsPlugin } from "emdash-plugin-forms";
  *
  * export default defineConfig({
  *   integrations: [
@@ -43,7 +43,7 @@ export function formsPlugin(
 		id: "forms",
 		version: "0.3.0",
 		format: "standard",
-		entrypoint: "emdash-plugin-leads/sandbox",
+		entrypoint: "emdash-plugin-forms/sandbox",
 		options,
 		capabilities: ["network:fetch", "read:users"],
 		allowedHosts: [

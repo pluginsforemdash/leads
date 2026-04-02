@@ -1,5 +1,5 @@
 {
-	"name": "emdash-plugin-leads",
+	"name": "emdash-plugin-forms",
 	"version": "0.3.0",
 	"description": "Forms and CRM plugin for EmDash CMS — form builder, submissions, spam protection, lead pipeline, and contact management",
 	"type": "module",
